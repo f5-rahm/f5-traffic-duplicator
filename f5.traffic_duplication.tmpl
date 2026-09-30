@@ -1,0 +1,623 @@
+#TMSH-VERSION: 17.1.0
+
+cli admin-partitions {
+    update-partition Common
+}
+sys application template /Common/f5.traffic_duplication {
+    actions {
+        definition {
+            html-help {
+                <p><b>TCP/UDP Packet Duplication Template (Modernized)</b></p>
+<p>This template creates a complete implementation of Layer 4 UDP or TCP packet duplication.</p>
+<ul>
+  <li>Supports TMOS 17.5.x, 21.1.x, and Route Domains.</li>
+  <li>Features high-performance High-Speed Logging (HSL) duplication.</li>
+  <li>Allows primary, secondary, and tertiary failover destination servers.</li>
+  <li>Full IPv4 and IPv6 dual-stack support.</li>
+</ul>
+
+<p><b>Virtual Server Questions</b></p>
+<p><i>IP address</i><br />
+Type the IP address clients will send traffic to. The system creates a virtual server using this address.</p>
+<p><i>Port</i><br />
+Type the associated service port (e.g., 514 for Syslog, 162 for SNMP Traps, or custom TCP/UDP ports).</p>
+<p><i>Failover</i><br />
+Allows automated health-checked failover within each destination group using priority groups.</p>
+            }
+            implementation {
+###########################################################################
+##       ffff55555                                                       ##
+##     fffff f555555                                                     ##
+##   fff      f5    5       TCP/UDP Packet Duplication iApp Version 4.1  ##
+##  ff    fffff     555                                                  ##
+##  ff    fffff f555555              Written By: F5 Networks             ##
+## fff       f     55555             Modernized for TMOS 17.5+ / 21.1+   ##
+## f        ff     55555                                                 ##
+## fff   ffff      ..:55                                                 ##
+## fff    fff5555 ..::,5                                                 ##
+##  ff    fff 555555,;;                                                  ##
+##   f    fff  55555,;                                                   ##
+##   f    fff    55,55                                                   ##
+##    ffffffff5555555                                                    ##
+##       fffffff55                                                       ##
+###########################################################################
+
+tmsh::log_dest file
+tmsh::log_level crit
+
+package require iapp 1.3.0
+
+proc is_safe_name { name } {
+    if { [regexp {^[a-zA-Z0-9_.-]+$} $name] } {
+        return 1
+    }
+    return 0
+}
+
+proc format_endpoint { addr port } {
+    if { [string match "*:*" $addr] } {
+        return "${addr}.${port}"
+    } else {
+        return "${addr}:${port}"
+    }
+}
+
+proc get_v6_distribute_ip { addr rd_suffix } {
+    set clean $addr
+    if { [string match "*%*" $clean] } {
+        set clean [lindex [split $clean "%"] 0]
+    }
+    
+    set idx [string first "::" $clean]
+    if { $idx >= 0 } {
+        set left_str ""
+        if { $idx > 0 } {
+            set left_str [string range $clean 0 [expr {$idx - 1}]]
+        }
+        set right_str [string range $clean [expr {$idx + 2}] end]
+        
+        set left_parts [list]
+        if { $left_str ne "" } {
+            set left_parts [split $left_str ":"]
+        }
+        set right_parts [list]
+        if { $right_str ne "" } {
+            set right_parts [split $right_str ":"]
+        }
+        
+        set num_zeros [expr {8 - [llength $left_parts] - [llength $right_parts]}]
+        set full_list $left_parts
+        for {set i 0} {$i < $num_zeros} {incr i} {
+            lappend full_list "0"
+        }
+        foreach rp $right_parts {
+            lappend full_list $rp
+        }
+    } else {
+        set full_list [split $clean ":"]
+    }
+    
+    set dist_parts [lreplace $full_list 0 0 "fdf5"]
+    set dist_ip [join $dist_parts ":"]
+    return "${dist_ip}${rd_suffix}"
+}
+
+proc tmsh_create { component arguments } {
+    iapp::conf create $component $arguments
+}
+
+proc tmsh_modify { component arguments } {
+    iapp::conf modify $component $arguments
+}
+
+proc configure_udp_deployment {} {
+    # Extract base address and optional route domain (%rd)
+    set clean_addr $::basic__addr
+    set rd_suffix ""
+    if { [string match "*%*" $clean_addr] } {
+        set parts [split $clean_addr "%"]
+        set clean_addr [lindex $parts 0]
+        set rd_suffix "%[lindex $parts 1]"
+    }
+
+    # Derive internal distribution IP (RFC 2544 / RFC 5735 Benchmark 198.19.c.d for IPv4, ULA fdf5:... for IPv6)
+    if { [scan $clean_addr %d.%d.%d.%d a b c d] == 4 } {
+        set distributeip "198.19.$c.$d$rd_suffix"
+        set mask_arg "mask 255.255.255.255"
+        set dist_mask "mask 255.255.255.255"
+        set dist_endpoint "$distributeip:$::basic__port"
+        set vip_endpoint "$::basic__addr:$::basic__port"
+    } else {
+        # IPv6
+        set distributeip [get_v6_distribute_ip $clean_addr $rd_suffix]
+        set mask_arg "mask ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+        set dist_mask "mask ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+        set dist_endpoint "$distributeip.$::basic__port"
+        set vip_endpoint "$::basic__addr.$::basic__port"
+    }
+
+    # Create UDP profile with datagram load balancing
+    tmsh_create "ltm profile udp" "pr_udp_$tmsh::app_name { defaults-from /Common/udp datagram-load-balancing enabled idle-timeout immediate }"
+
+    # Build monitor string
+    set monitorinfo ""
+    if { [info exists ::basic__monitor] && $::basic__monitor ne "" && $::basic__monitor ne "none" } {
+        set mon_list [split [string trim $::basic__monitor] " \n"]
+        set valid_mons {}
+        foreach m $mon_list {
+            set m [string trim $m]
+            if { $m ne "" && $m ne "none" } {
+                lappend valid_mons $m
+            }
+        }
+        if { [llength $valid_mons] > 0 } {
+            set monitorinfo "monitor [join $valid_mons { and }]"
+        } else {
+            set monitorinfo "monitor none"
+        }
+    } else {
+        set monitorinfo "monitor none"
+    }
+
+    # Build pool members and data group records
+    set members ""
+    foreach member $::destinations__servers {
+        set existing ""
+        catch { set existing [tmsh::get_field_value $member existingpool] }
+        set dest_name [tmsh::get_field_value $member name]
+        
+        if { $::basic__numberofservers == "Just Existing Pools" || $existing ne "" } {
+            append members "$existing { data \"$dest_name\" } "
+        } else {
+            if { $::basic__numberofservers == "1" } {
+                set addr1 [tmsh::get_field_value $member addr1]
+                set port1 [tmsh::get_field_value $member port1]
+                set ep [format_endpoint $addr1 $port1]
+                append members "$ep { data \"$dest_name\" } "
+            } else {
+                set poolmembers ""
+                set servernumber 1
+                set createpool 0
+                while { $servernumber <= $::basic__numberofservers } {
+                    set prioritygroup 200
+                    set opmode "Failover"
+                    catch { set opmode [tmsh::get_field_value $member operationmode] }
+                    if { $opmode eq "Failover" } {
+                        set prioritygroup [expr { 210 - ($servernumber * 10) }]
+                    }
+                    set s_addr ""
+                    set s_port ""
+                    catch { set s_addr [tmsh::get_field_value $member addr$servernumber] }
+                    catch { set s_port [tmsh::get_field_value $member port$servernumber] }
+                    if { $s_addr ne "" } {
+                        if { $servernumber > 1 } { set createpool 1 }
+                        set ep [format_endpoint $s_addr $s_port]
+                        append poolmembers " $ep { address $s_addr priority-group $prioritygroup } "
+                    }
+                    incr servernumber
+                }
+                if { $createpool == 1 } {
+                    set poolname "${tmsh::app_name}_${dest_name}_udp"
+                    if { [is_safe_name $poolname] != 1 } {
+                        error "The pool name '$poolname' contains illegal characters."
+                    }
+                    tmsh_create "ltm pool" "$poolname { min-active-members 1 $monitorinfo members replace-all-with { $poolmembers } }"
+                    append members "$poolname { data \"$dest_name\" } "
+                } else {
+                    set addr1 [tmsh::get_field_value $member addr1]
+                    set port1 [tmsh::get_field_value $member port1]
+                    set ep [format_endpoint $addr1 $port1]
+                    append members "$ep { data \"$dest_name\" } "
+                }
+            }
+        }
+    }
+
+    # Create data group
+    tmsh_create "ltm data-group internal" "dg_$tmsh::app_name { records replace-all-with { $members } type string }"
+
+    # Create internal distribution HSL pool
+    tmsh_create "ltm pool" "$tmsh::app_name { members replace-all-with { $dist_endpoint { address $distributeip } } }"
+
+    # Modernized ir_udp_spray iRule (Delimited UTF8/ASCII clean encapsulation)
+    set irule_spray [format {
+when CLIENT_ACCEPTED {
+    set cli_ip [IP::client_addr]
+    set orig_payload [UDP::payload]
+    set hsl [HSL::open -proto UDP -pool "%s"]
+    
+    foreach dest [class names "dg_%s"] {
+        set hdr "${cli_ip}#${dest}#"
+        HSL::send $hsl "${hdr}${orig_payload}"
+    }
+    discard
+}
+} $tmsh::app_name $tmsh::app_name]
+
+    set irulenamespray "ir_${tmsh::app_name}_udp_spray"
+    tmsh_create "ltm rule" "$irulenamespray { $irule_spray }"
+
+    # Modernized ir_distribute iRule (Robust delimited parsing & client-IP preservation)
+    set irule_distribute {
+when CLIENT_ACCEPTED {
+    set payload [UDP::payload]
+    set first_hash [string first "#" $payload]
+    
+    if { $first_hash > 0 } {
+        set second_hash [string first "#" $payload [expr {$first_hash + 1}]]
+        
+        if { $second_hash > $first_hash } {
+            set cli_ip [string range $payload 0 [expr {$first_hash - 1}]]
+            set destination [string range $payload [expr {$first_hash + 1}] [expr {$second_hash - 1}]]
+            set data [string range $payload [expr {$second_hash + 1}] end]
+            
+            # Restore original packet payload
+            UDP::payload replace 0 [UDP::payload length] $data
+            
+            # Preserve original client IP
+            catch { snat $cli_ip }
+            
+            # Forward to direct node or pool
+            set destination [string trim $destination]
+            if { [string match "*:*" $destination] } {
+                if { [string match "*::*" $destination] || [string match "*:*:*" $destination] } {
+                    # IPv6 endpoint: addr.port
+                    set last_dot [string last "." $destination]
+                    if { $last_dot > 0 } {
+                        set node_ip [string range $destination 0 [expr {$last_dot - 1}]]
+                        set node_port [string range $destination [expr {$last_dot + 1}] end]
+                        if { $node_ip ne "" && $node_port ne "" } {
+                            node $node_ip $node_port
+                        } else {
+                            discard
+                        }
+                    } else {
+                        discard
+                    }
+                } else {
+                    # IPv4 endpoint: addr:port
+                    set last_colon [string last ":" $destination]
+                    if { $last_colon > 0 } {
+                        set node_ip [string range $destination 0 [expr {$last_colon - 1}]]
+                        set node_port [string range $destination [expr {$last_colon + 1}] end]
+                        if { $node_ip ne "" && $node_port ne "" } {
+                            node $node_ip $node_port
+                        } else {
+                            discard
+                        }
+                    } else {
+                        discard
+                    }
+                }
+            } else {
+                # Pool name
+                if { [catch { pool $destination }] } {
+                    discard
+                }
+            }
+            return
+        }
+    }
+    discard
+}
+}
+
+    set irulenamedistribute "ir_${tmsh::app_name}_distribute"
+    tmsh_create "ltm rule" "$irulenamedistribute { $irule_distribute }"
+
+    # Create internal distribution Virtual Server
+    tmsh_create "ltm virtual" "${tmsh::app_name}_distribute { destination $dist_endpoint $dist_mask ip-protocol udp profiles replace-all-with { pr_udp_$tmsh::app_name { } } rules { $irulenamedistribute } source-port change translate-address enabled translate-port enabled vlans-disabled }"
+
+    # Create primary listener Virtual Server
+    tmsh_create "ltm virtual" "${tmsh::app_name}_udp { destination $vip_endpoint ip-protocol udp $mask_arg profiles replace-all-with { pr_udp_$tmsh::app_name { } } rules { $irulenamespray } vlans-disabled }"
+}
+
+proc configure_tcp_deployment {} {
+    # Extract base address and optional route domain (%rd)
+    set clean_addr $::basic__addr
+    set rd_suffix ""
+    if { [string match "*%*" $clean_addr] } {
+        set parts [split $clean_addr "%"]
+        set clean_addr [lindex $parts 0]
+        set rd_suffix "%[lindex $parts 1]"
+    }
+
+    if { [scan $clean_addr %d.%d.%d.%d a b c d] == 4 } {
+        set mask_arg "mask 255.255.255.255"
+        set vip_endpoint "$::basic__addr:$::basic__port"
+    } else {
+        # IPv6
+        set mask_arg "mask ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+        set vip_endpoint "$::basic__addr.$::basic__port"
+    }
+
+    # Build monitor string
+    set monitorinfo ""
+    if { [info exists ::basic__monitor] && $::basic__monitor ne "" && $::basic__monitor ne "none" } {
+        set mon_list [split [string trim $::basic__monitor] " \n"]
+        set valid_mons {}
+        foreach m $mon_list {
+            set m [string trim $m]
+            if { $m ne "" && $m ne "none" } {
+                lappend valid_mons $m
+            }
+        }
+        if { [llength $valid_mons] > 0 } {
+            set monitorinfo "monitor [join $valid_mons { and }]"
+        } else {
+            set monitorinfo "monitor none"
+        }
+    } else {
+        set monitorinfo "monitor none"
+    }
+
+    set members [list]
+    foreach member $::destinations__servers {
+        set existing ""
+        catch { set existing [tmsh::get_field_value $member existingpool] }
+        set dest_name [tmsh::get_field_value $member name]
+
+        if { $::basic__numberofservers == "Just Existing Pools" || $existing ne "" } {
+            lappend members $existing
+        } else {
+            set poolmembers ""
+            set servernumber 1
+            while { $servernumber <= $::basic__numberofservers } {
+                set prioritygroup 200
+                set opmode "Failover"
+                catch { set opmode [tmsh::get_field_value $member operationmode] }
+                if { $opmode eq "Failover" } {
+                    set prioritygroup [expr { 210 - ($servernumber * 10) }]
+                }
+                set s_addr ""
+                set s_port ""
+                catch { set s_addr [tmsh::get_field_value $member addr$servernumber] }
+                catch { set s_port [tmsh::get_field_value $member port$servernumber] }
+                if { $s_addr ne "" } {
+                    set ep [format_endpoint $s_addr $s_port]
+                    append poolmembers " $ep { address $s_addr priority-group $prioritygroup } "
+                }
+                incr servernumber
+            }
+            set poolname "${tmsh::app_name}_${dest_name}_tcp"
+            if { [is_safe_name $poolname] != 1 } {
+                error "The pool name '$poolname' contains illegal characters."
+            }
+            tmsh_create "ltm pool" "$poolname { min-active-members 1 $monitorinfo members replace-all-with { $poolmembers } }"
+            lappend members $poolname
+        }
+    }
+
+    # Build TCP spray iRule (open HSL in CLIENT_ACCEPTED, stream in CLIENT_DATA)
+    set hsl_opens ""
+    foreach member $members {
+        append hsl_opens "    lappend hsl_list \[HSL::open -proto TCP -pool \"$member\"\]\n"
+    }
+
+    set irule_tcp ""
+    append irule_tcp "when CLIENT_ACCEPTED {\n"
+    append irule_tcp "    set hsl_list \[list\]\n"
+    append irule_tcp $hsl_opens
+    append irule_tcp "    TCP::collect\n"
+    append irule_tcp "}\n\n"
+    append irule_tcp "when CLIENT_DATA {\n"
+    append irule_tcp "    set pdata \[TCP::payload\]\n"
+    append irule_tcp "    if { \[string length \$pdata\] > 0 } {\n"
+    append irule_tcp "        foreach hsl \$hsl_list {\n"
+    append irule_tcp "            HSL::send \$hsl \$pdata\n"
+    append irule_tcp "        }\n"
+    append irule_tcp "        TCP::payload replace 0 \[TCP::payload length\] \"\"\n"
+    append irule_tcp "    }\n"
+    append irule_tcp "    TCP::collect\n"
+    append irule_tcp "}\n"
+
+    set irulenamespray "ir_${tmsh::app_name}_tcp_spray"
+    tmsh_create "ltm rule" "$irulenamespray { $irule_tcp }"
+
+    # Create primary listener Virtual Server
+    tmsh_create "ltm virtual" "${tmsh::app_name}_tcp { destination $vip_endpoint ip-protocol tcp $mask_arg profiles replace-all-with { tcp { } } rules { $irulenamespray } vlans-disabled }"
+}
+
+# Main Script Execution
+if { [is_safe_name $tmsh::app_name] != 1 } {
+    error "The app template name '$tmsh::app_name' contains illegal characters."
+}
+
+if { $::basic__protocol eq "UDP" || $::basic__protocol eq "Both" } {
+    configure_udp_deployment
+}
+if { $::basic__protocol eq "TCP" || $::basic__protocol eq "Both" } {
+    configure_tcp_deployment
+}
+            }
+            macro {
+            }
+            presentation {
+section intro {
+    message hello "This template allows TCP or UDP packets to be duplicated to multiple destinations."
+    message check_for_updates "Ensure you are using the most recent template. Modernized for TMOS 17.5.x and 21.1.x."
+}
+
+section basic {
+    choice protocol display "medium" default "UDP" {"UDP", "TCP", "Both"}
+    string addr required validator "IpAddress"
+    string port required validator "PortNumber" display "small" 
+    choice numberofservers display "xlarge" default "1" {"Just Existing Pools", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"}
+    optional ( basic.numberofservers != "1" && basic.numberofservers != "Just Existing Pools" ) {
+        multichoice monitor display "xxlarge" tcl {
+            package require iapp 1.3.0
+            set choices "[iapp::get_items ltm monitor tcp]\n[iapp::get_items ltm monitor udp]\n[iapp::get_items ltm monitor gateway-icmp]\n[iapp::get_items ltm monitor http]"
+            return $choices
+        }
+    }
+}
+
+section destinations {
+    table servers {
+        string name display "large" required      
+        optional ( basic.numberofservers == "Just Existing Pools" ) {
+            choice existingpool display "xlarge" default "" tcl {
+                package require iapp 1.3.0
+                set choices "\n[iapp::get_items ltm pool]"
+                return $choices
+            }
+        }
+        optional ( basic.numberofservers != "Just Existing Pools" ) {
+            optional ( basic.numberofservers != "1" ) {
+                choice operationmode default "Failover" {"Failover", "LoadBalance"} 
+            }
+            string addr1 validator "IpAddress"
+            string port1 validator "PortNumber" display "small"
+            optional ( basic.numberofservers == "2" || basic.numberofservers == "3" || basic.numberofservers == "4" || basic.numberofservers == "5" || basic.numberofservers == "6" || basic.numberofservers == "7" || basic.numberofservers == "8" || basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr2 validator "IpAddress"
+                string port2 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "3" || basic.numberofservers == "4" || basic.numberofservers == "5" || basic.numberofservers == "6" || basic.numberofservers == "7" || basic.numberofservers == "8" || basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr3 validator "IpAddress"
+                string port3 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "4" || basic.numberofservers == "5" || basic.numberofservers == "6" || basic.numberofservers == "7" || basic.numberofservers == "8" || basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr4 validator "IpAddress"
+                string port4 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "5" || basic.numberofservers == "6" || basic.numberofservers == "7" || basic.numberofservers == "8" || basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr5 validator "IpAddress"
+                string port5 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "6" || basic.numberofservers == "7" || basic.numberofservers == "8" || basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr6 validator "IpAddress"
+                string port6 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "7" || basic.numberofservers == "8" || basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr7 validator "IpAddress"
+                string port7 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "8" || basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr8 validator "IpAddress"
+                string port8 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "9" || basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr9 validator "IpAddress"
+                string port9 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "10" || basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr10 validator "IpAddress"
+                string port10 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "11" || basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr11 validator "IpAddress"
+                string port11 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "12" || basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr12 validator "IpAddress"
+                string port12 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "13" || basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr13 validator "IpAddress"
+                string port13 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "14" || basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr14 validator "IpAddress"
+                string port14 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "15" || basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr15 validator "IpAddress"
+                string port15 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "16" || basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr16 validator "IpAddress"
+                string port16 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "17" || basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr17 validator "IpAddress"
+                string port17 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "18" || basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr18 validator "IpAddress"
+                string port18 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "19" || basic.numberofservers == "20" ) {
+                string addr19 validator "IpAddress"
+                string port19 validator "PortNumber" display "small"
+            }
+            optional ( basic.numberofservers == "20" ) {
+                string addr20 validator "IpAddress"
+                string port20 validator "PortNumber" display "small"
+            }
+        }
+    }
+}
+
+text
+{
+    intro "Welcome to the TCP/UDP packet duplication template"
+    intro.hello "Introduction"
+    intro.check_for_updates "Check for updates"
+
+    basic "Virtual Server Questions"
+    basic.protocol "What protocol will be used?"
+    basic.addr "What IP address do you want to use for this virtual server?"
+    basic.port "What port do you want to use for this virtual server?"
+    basic.monitor "What verification should be done to ensure destination's servers are online?"
+    basic.numberofservers "How many servers make up each destination?"
+
+    destinations "Destination Server Questions"
+    destinations.servers "Destinations"
+    destinations.servers.name "Destination Name"
+    destinations.servers.existingpool "Existing Pool"
+    destinations.servers.operationmode "Operation Mode"
+    destinations.servers.addr1 "ServerIP1"
+    destinations.servers.port1 "Port"
+    destinations.servers.addr2 "ServerIP2"
+    destinations.servers.port2 "Port"
+    destinations.servers.addr3 "ServerIP3"
+    destinations.servers.port3 "Port"
+    destinations.servers.addr4 "ServerIP4"
+    destinations.servers.port4 "Port"
+    destinations.servers.addr5 "ServerIP5"
+    destinations.servers.port5 "Port"
+    destinations.servers.addr6 "ServerIP6"
+    destinations.servers.port6 "Port"
+    destinations.servers.addr7 "ServerIP7"
+    destinations.servers.port7 "Port"
+    destinations.servers.addr8 "ServerIP8"
+    destinations.servers.port8 "Port"
+    destinations.servers.addr9 "ServerIP9"
+    destinations.servers.port9 "Port"
+    destinations.servers.addr10 "ServerIP10"
+    destinations.servers.port10 "Port"
+    destinations.servers.addr11 "ServerIP11"
+    destinations.servers.port11 "Port"
+    destinations.servers.addr12 "ServerIP12"
+    destinations.servers.port12 "Port"
+    destinations.servers.addr13 "ServerIP13"
+    destinations.servers.port13 "Port"
+    destinations.servers.addr14 "ServerIP14"
+    destinations.servers.port14 "Port"
+    destinations.servers.addr15 "ServerIP15"
+    destinations.servers.port15 "Port"
+    destinations.servers.addr16 "ServerIP16"
+    destinations.servers.port16 "Port"
+    destinations.servers.addr17 "ServerIP17"
+    destinations.servers.port17 "Port"
+    destinations.servers.addr18 "ServerIP18"
+    destinations.servers.port18 "Port"
+    destinations.servers.addr19 "ServerIP19"
+    destinations.servers.port19 "Port"
+    destinations.servers.addr20 "ServerIP20"
+    destinations.servers.port20 "Port"
+}
+            }
+            role-acl none
+            run-as none
+        }
+    }
+    description "Modernized Traffic Duplication Template for TMOS 17.5.x and 21.1.x"
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min 16.0.0
+    requires-modules none
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature none
+}
