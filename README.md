@@ -9,6 +9,9 @@ I created separate version deploy scripts so I could test all versions at once, 
 - [17.5 App Services Deployment](deploy_175.sh) | [17.5 App Services Teardown](teardown_175.sh)
 - [21.1 App Services Deployment](deploy_211.sh) | [21.1 App Services Teardown](teardown_211.sh)
 
+## Diagrams
+- [Use Case diagrams](f5_traffic_duplication_walkthrough.md)
+
 ## App Services Test Harness
 I had a single Ubuntu server on both sides of BIG-IP, ingress and egress, so I could deploy a single test harness to send and receive the traffic. This script handles it all.
 - [Test Harness](run_all_tests.py)
