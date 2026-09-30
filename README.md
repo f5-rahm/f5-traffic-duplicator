@@ -1,7 +1,7 @@
 # f5-traffic-duplicator
 iApp that deploys front-end and back-end iRules to duplicate packets on BIG-IP
 
-- (iApp Template)[f5.traffic_duplication.tmpl]
+- [iApp Template](f5.traffic_duplication.tmpl)
 
 ## Deploy App Services
 I created separate version deploy scripts so I could test all versions at once, this is not likely a requirement for you but the details are here if you want to do the same. One of these is probably sufficient, however.
